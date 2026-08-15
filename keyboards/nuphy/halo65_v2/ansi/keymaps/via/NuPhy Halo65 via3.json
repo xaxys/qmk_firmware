@@ -191,6 +191,38 @@
 	{
 		"name": "Side\nSlow",
 		"title": "Side Speed -"
+	},
+	{
+		"name": "Code\nMode",
+		"title": "Code Mode"
+	},
+	{
+		"name": "Paint\nMode",
+		"title": "Paint Mode"
+	},
+	{
+		"name": "Fn\nSwitch",
+		"title": "Swap only 1-0, -, = between Mac layers 1/2 or Windows layers 4/5"
+	},
+	{
+		"name": "Fn\nLock",
+		"title": "Lock 1-0, -, = to Mac layer 1 or Windows layer 4"
+	},
+	{
+		"name": "Tap/\nHold 1",
+		"title": "Tap sends VIA Macro 0; hold 500 ms sends VIA Macro 1"
+	},
+	{
+		"name": "Dbl\nTap 1",
+		"title": "Double-tap sends VIA Macro 2"
+	},
+	{
+		"name": "Tap/\nHold 2",
+		"title": "Tap sends VIA Macro 3; hold 500 ms sends VIA Macro 4"
+	},
+	{
+		"name": "Dbl\nTap 2",
+		"title": "Double-tap sends VIA Macro 5"
 	}
 ]
 }

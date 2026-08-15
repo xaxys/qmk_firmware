@@ -31,7 +31,35 @@ enum custom_keycodes {
     SIDE_HUI,
     SIDE_SPI,
     SIDE_SPD,
+
+    // Present in the current NuPhy VIA definition and factory layout, but
+    // absent from the published Halo65 V2 source implementation. Reserve the
+    // numeric slots so new features never hijack the factory keycodes.
+    CODE_MODE,
+    PAINT_MODE,
+
+    FN_SWITCH,
+    FN_LOCK,
+    TAP_HOLD_1,
+    DBL_TAP_1,
+    TAP_HOLD_2,
+    DBL_TAP_2,
 };
+
+// Little-endian EEPROM bytes spell "HFN3" (Halo Fn features, schema 3).
+// A mismatch disables the optional features instead of trusting stale bytes.
+#define FN_FEATURES_EEPROM_MAGIC 0x334E4648UL
+
+// VIA's custom-key list is positional. Fail the build if an enum edit would
+// silently make the JSON labels select different firmware actions.
+_Static_assert(CODE_MODE == 0x7E17, "CODE_MODE must retain its factory VIA keycode");
+_Static_assert(PAINT_MODE == 0x7E18, "PAINT_MODE must retain its factory VIA keycode");
+_Static_assert(FN_SWITCH == 0x7E19, "FN_SWITCH must match the VIA custom keycode order");
+_Static_assert(FN_LOCK == 0x7E1A, "FN_LOCK must match the VIA custom keycode order");
+_Static_assert(TAP_HOLD_1 == 0x7E1B, "TAP_HOLD_1 must match the VIA custom keycode order");
+_Static_assert(DBL_TAP_1 == 0x7E1C, "DBL_TAP_1 must match the VIA custom keycode order");
+_Static_assert(TAP_HOLD_2 == 0x7E1D, "TAP_HOLD_2 must match the VIA custom keycode order");
+_Static_assert(DBL_TAP_2 == 0x7E1E, "DBL_TAP_2 must match the VIA custom keycode order");
 
 extern uint8_t m_sleep_led;
 
@@ -200,7 +228,23 @@ typedef struct
     uint8_t ee_side_rgb;
     uint8_t ee_side_colour;
     m_8bit ee_dev_config;
+    uint32_t fn_features_magic;
 } user_config_t;
+
+_Static_assert(sizeof(user_config_t) == EECONFIG_USER_DATA_SIZE, "user_config_t must match the configured EEPROM user data size");
+_Static_assert(offsetof(user_config_t, fn_features_magic) == 8, "Fn feature magic must start at EEPROM user byte 8");
+_Static_assert((offsetof(user_config_t, fn_features_magic) % _Alignof(uint32_t)) == 0, "Fn feature magic must be 32-bit aligned");
+_Static_assert(_Alignof(user_config_t) >= _Alignof(uint32_t), "user_config_t must retain 32-bit alignment");
+
+static inline bool fn_features_magic_is_valid(const user_config_t *config) {
+    return config->fn_features_magic == FN_FEATURES_EEPROM_MAGIC;
+}
+
+static inline void fn_features_magic_set(user_config_t *config) {
+    config->fn_features_magic = FN_FEATURES_EEPROM_MAGIC;
+}
 
 extern user_config_t user_config;
 #define f_dev_sleep_enable  user_config.ee_dev_config.bit0
+#define f_fn_switch         user_config.ee_dev_config.bit1
+#define f_fn_lock           user_config.ee_dev_config.bit2
