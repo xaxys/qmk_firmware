@@ -147,6 +147,41 @@ static uint8_t  ind_tap_hold_count;
 static uint8_t  ind_fn_pos;
 static uint32_t ind_rescan_timer;
 
+// RGB Matrix state-indicator colours (Caps Lock green, Tap/Hold blue,
+// Fn Lock orange). Shared with the Fn Switch flash so everything stays in sync.
+#define IND_CAPS_LOCK_R 0x00
+#define IND_CAPS_LOCK_G 0xFF
+#define IND_CAPS_LOCK_B 0x00
+#define IND_TAP_HOLD_R  0x00
+#define IND_TAP_HOLD_G  0x80
+#define IND_TAP_HOLD_B  0xFF
+#define IND_FN_LOCK_R   0xFF
+#define IND_FN_LOCK_G   0x40
+#define IND_FN_LOCK_B   0x00
+
+// Fn Switch one-shot flash: when Fn Switch flips (double-tap Fn or the
+// FN_SWITCH custom key), light the number row (1-0, -, =) LEDs at full
+// brightness for FN_SWITCH_FLASH_HOLD_TERM then fade them out over
+// FN_SWITCH_FLASH_FADE_TERM, like a key-press effect. OFF uses the Fn Lock
+// orange, ON uses the Tap/Hold blue (the same colours as the persistent
+// indicators). A new toggle while the flash is still running restarts it with
+// the new state's colour (see fn_switch_flash_trigger).
+#define FN_SWITCH_FLASH_HOLD_TERM 1000
+#define FN_SWITCH_FLASH_FADE_TERM 500
+#define FN_SWITCH_FLASH_TERM      (FN_SWITCH_FLASH_HOLD_TERM + FN_SWITCH_FLASH_FADE_TERM)
+#define FN_SWITCH_FLASH_LED_FIRST 1     // LED index of "1"
+#define FN_SWITCH_FLASH_LED_LAST  12    // LED index of "="
+#define FN_SWITCH_FLASH_OFF_R     IND_FN_LOCK_R
+#define FN_SWITCH_FLASH_OFF_G     IND_FN_LOCK_G
+#define FN_SWITCH_FLASH_OFF_B     IND_FN_LOCK_B
+#define FN_SWITCH_FLASH_ON_R      IND_TAP_HOLD_R
+#define FN_SWITCH_FLASH_ON_G      IND_TAP_HOLD_G
+#define FN_SWITCH_FLASH_ON_B      IND_TAP_HOLD_B
+#define FN_SWITCH_FLASH_MAX_RGB   255    // full 8-bit colour/brightness scale
+
+static uint32_t fn_switch_flash_time;    // when the flash started (0 = idle)
+static bool     fn_switch_flash_state;   // Fn Switch state captured at start
+
 void rf_device_init(void);
 void rf_uart_init(void);
 void m_side_led_show(void);
@@ -623,6 +658,16 @@ static void fn_dbl_tap_press(void) {
     fn_tap_other_key = false;
 }
 
+// Start (or restart) the one-shot number-row flash after an Fn Switch toggle.
+// Captures the new state so the colour reflects the layer the number row now
+// reads (OFF -> Fn layer, ON -> Fn+Shift layer). Resetting the timer here is
+// what lets a later double-tap Fn / FN_SWITCH press interrupt and replace any
+// flash that is still running from a previous toggle.
+static void fn_switch_flash_trigger(void) {
+    fn_switch_flash_time  = timer_read32();
+    fn_switch_flash_state = f_fn_switch;
+}
+
 /**
  * @brief  Fn double-tap (toggles Fn Switch) - release side.
  */
@@ -638,6 +683,7 @@ static void fn_dbl_tap_release(void) {
         if (timer_elapsed(fn_press_time) <= FN_DBL_TAP_TERM) {
             f_fn_switch = !f_fn_switch;
             fn_features_save_config();
+            fn_switch_flash_trigger();
         }
     } else if (!fn_tap_other_key && timer_elapsed(fn_press_time) <= FN_DBL_TAP_TERM) {
         fn_dbl_tap_timer = timer_read();
@@ -781,6 +827,7 @@ bool process_record_kb(uint16_t keycode, keyrecord_t *record) {
             if (record->event.pressed && (dev_info.sys_sw_state == SYS_SW_MAC || dev_info.sys_sw_state == SYS_SW_WIN)) {
                 f_fn_switch = !f_fn_switch;
                 fn_features_save_config();
+                fn_switch_flash_trigger();
             }
             return false;
 
@@ -1317,19 +1364,51 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max)
         for (uint8_t i = 0; i < ind_tap_hold_count; i++) {
             uint8_t led = ind_tap_hold_pos[i];
             if (led >= led_min && led < led_max) {
-                rgb_matrix_set_color(led, 0x00, 0x80, 0xFF);
+                rgb_matrix_set_color(led, IND_TAP_HOLD_R, IND_TAP_HOLD_G, IND_TAP_HOLD_B);
             }
         }
         for (uint8_t i = 0; i < ind_caps_count; i++) {
             uint8_t led = ind_caps_pos[i];
             if (led >= led_min && led < led_max) {
-                rgb_matrix_set_color(led, 0x00, 0xFF, 0x00);
+                rgb_matrix_set_color(led, IND_CAPS_LOCK_R, IND_CAPS_LOCK_G, IND_CAPS_LOCK_B);
             }
         }
     }
 
     if (f_fn_lock && ind_fn_pos != NO_LED && ind_fn_pos >= led_min && ind_fn_pos < led_max) {
-        rgb_matrix_set_color(ind_fn_pos, 0xFF, 0x40, 0x00);
+        rgb_matrix_set_color(ind_fn_pos, IND_FN_LOCK_R, IND_FN_LOCK_G, IND_FN_LOCK_B);
+    }
+
+    // Fn Switch one-shot flash: the number row (1-0, -, =) holds full
+    // brightness for 1 s then fades out over 0.5 s. OFF -> Fn Lock orange,
+    // ON -> Tap/Hold blue. A new toggle restarts it (interrupting the old one).
+    if (fn_switch_flash_time != 0) {
+        uint32_t flash_elapsed = timer_elapsed32(fn_switch_flash_time);
+        if (flash_elapsed < FN_SWITCH_FLASH_TERM) {
+            uint8_t base_r = fn_switch_flash_state ? FN_SWITCH_FLASH_ON_R : FN_SWITCH_FLASH_OFF_R;
+            uint8_t base_g = fn_switch_flash_state ? FN_SWITCH_FLASH_ON_G : FN_SWITCH_FLASH_OFF_G;
+            uint8_t base_b = fn_switch_flash_state ? FN_SWITCH_FLASH_ON_B : FN_SWITCH_FLASH_OFF_B;
+            uint32_t scale;
+            if (flash_elapsed < FN_SWITCH_FLASH_HOLD_TERM) {
+                // Hold phase: full brightness for the first second.
+                scale = FN_SWITCH_FLASH_MAX_RGB;
+            } else {
+                // Fade phase: linear fade-out from full to zero over 0.5 s.
+                uint32_t fade_elapsed = flash_elapsed - FN_SWITCH_FLASH_HOLD_TERM;
+                uint32_t remaining    = FN_SWITCH_FLASH_FADE_TERM - fade_elapsed;
+                scale = (remaining * FN_SWITCH_FLASH_MAX_RGB) / FN_SWITCH_FLASH_FADE_TERM;
+            }
+            uint8_t  r = (uint8_t)((base_r * scale) / FN_SWITCH_FLASH_MAX_RGB);
+            uint8_t  g = (uint8_t)((base_g * scale) / FN_SWITCH_FLASH_MAX_RGB);
+            uint8_t  b = (uint8_t)((base_b * scale) / FN_SWITCH_FLASH_MAX_RGB);
+            for (uint8_t led = FN_SWITCH_FLASH_LED_FIRST; led <= FN_SWITCH_FLASH_LED_LAST; led++) {
+                if (led >= led_min && led < led_max) {
+                    rgb_matrix_set_color(led, r, g, b);
+                }
+            }
+        } else {
+            fn_switch_flash_time = 0;
+        }
     }
 
     return true;
