@@ -1070,6 +1070,8 @@ void device_reset_init(void)
     user_config.ee_side_rgb             = side_rgb;
     user_config.ee_side_colour          = side_colour;
     f_dev_sleep_enable                  = true;
+    f_fn_lock                           = false;
+    fn_features_magic_set(&user_config);
     eeconfig_update_user_datablock(&user_config);
 }
 

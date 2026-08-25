@@ -18,6 +18,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "ansi.h"
 #include "usb_main.h"
 #include "rf_driver.h"
+#include "keymap_introspection.h"
+#ifdef VIA_ENABLE
+#    include "dynamic_keymap.h"
+#    include "via.h"
+#endif
 
 
 user_config_t user_config;  
@@ -76,6 +81,56 @@ bool f_dev_reset_press  = 0;
 bool f_rgb_test_press   = 0; 
 bool f_win_lock         = 0; 
 
+// Release before this many milliseconds for VIA Macro 0. Reaching the term
+// while the key remains held emits VIA Macro 1 immediately.
+#define TAP_HOLD_TERM 500
+#define FN_ROW_FIRST_COL 1
+#define FN_ROW_LAST_COL 12
+#define FN_ROW_KEY_COUNT (FN_ROW_LAST_COL - FN_ROW_FIRST_COL + 1)
+
+// Layer and matrix constants. Single source of truth for the Fn Lock
+// F-row logic, so layout numbers never need to be hunted for.
+#define LAYER_MAC_BASE     0
+#define LAYER_MAC_FN       1
+#define LAYER_WIN_BASE     2
+#define LAYER_WIN_FN       3
+#define FN_KEY_ROW         0   // matrix row holding F1-F12
+
+static bool fn_held = false;
+static bool fn_row_key_active[FN_ROW_KEY_COUNT];
+static uint16_t fn_row_keycode[FN_ROW_KEY_COUNT];
+static uint16_t tap_hold_timer;
+static bool tap_hold_active;
+static bool tap_hold_hold_sent;
+static bool fn_features_validate_pending;
+
+// Tap/Hold 2 (second slot): tap -> VIA Macro 3, hold 500 ms -> Macro 4.
+static uint16_t tap_hold_timer_2;
+static bool     tap_hold_active_2;
+static bool     tap_hold_hold_sent_2;
+
+// Dynamic state-indicator cache. Rescanned periodically from the current
+// base layer so the lit keys follow VIA remaps (Caps/Tap-Hold/Fn).
+#define IND_MAX_POS 4
+static uint8_t  ind_caps_pos[IND_MAX_POS];
+static uint8_t  ind_caps_count;
+static uint8_t  ind_tap_hold_pos[IND_MAX_POS];
+static uint8_t  ind_tap_hold_count;
+static uint8_t  ind_fn_pos;
+static uint32_t ind_rescan_timer;
+
+// RGB Matrix state-indicator colours (Caps Lock green, Tap/Hold blue,
+// Fn Lock orange).
+#define IND_CAPS_LOCK_R 0x00
+#define IND_CAPS_LOCK_G 0xFF
+#define IND_CAPS_LOCK_B 0x00
+#define IND_TAP_HOLD_R  0x00
+#define IND_TAP_HOLD_G  0x80
+#define IND_TAP_HOLD_B  0xFF
+#define IND_FN_LOCK_R   0xFF
+#define IND_FN_LOCK_G   0x40
+#define IND_FN_LOCK_B   0x00
+
 void rf_device_init(void);
 void rf_uart_init(void);
 void m_side_led_show(void);
@@ -96,6 +151,99 @@ extern void side_colour_control(uint8_t dir);
 extern void side_mode_a_control(uint8_t dir);
 extern void side_mode_b_control(uint8_t dir);
 extern bool low_bat_flag;
+
+
+static void fn_features_save_config(void) {
+    fn_features_magic_set(&user_config);
+    eeconfig_update_user_datablock(&user_config);
+}
+
+static void fn_row_release_all(void) {
+    for (uint8_t index = 0; index < FN_ROW_KEY_COUNT; index++) {
+        if (fn_row_key_active[index]) {
+            unregister_code16(fn_row_keycode[index]);
+            fn_row_key_active[index] = false;
+        }
+    }
+}
+
+static void fn_features_disable(void) {
+    bool changed = f_fn_lock || !fn_features_magic_is_valid(&user_config);
+
+    f_fn_lock = false;
+    tap_hold_active = false;
+    tap_hold_hold_sent = false;
+    tap_hold_active_2 = false;
+    tap_hold_hold_sent_2 = false;
+    fn_row_release_all();
+
+    if (changed) {
+        fn_features_save_config();
+    }
+}
+
+#ifdef VIA_ENABLE
+static bool dynamic_keymap_contains_keycode(uint16_t keycode) {
+    for (uint8_t layer = 0; layer < DYNAMIC_KEYMAP_LAYER_COUNT; layer++) {
+        for (uint8_t row = 0; row < MATRIX_ROWS; row++) {
+            for (uint8_t col = 0; col < MATRIX_COLS; col++) {
+                if (dynamic_keymap_get_keycode(layer, row, col) == keycode) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+static void fn_features_validate_configuration(void) {
+    bool changed = false;
+
+    if (f_fn_lock && !dynamic_keymap_contains_keycode(FN_LOCK)) {
+        f_fn_lock = false;
+        fn_row_release_all();
+        changed = true;
+    }
+
+    if (changed) {
+        fn_features_save_config();
+    }
+}
+#else
+static void fn_features_validate_configuration(void) {
+    fn_features_disable();
+}
+#endif
+
+static bool fn_row_keycode_supported(uint16_t keycode) {
+    return keycode != KC_NO && keycode != KC_TRNS && (IS_QK_BASIC(keycode) || IS_QK_MODS(keycode));
+}
+
+#ifdef VIA_ENABLE
+bool via_command_kb(uint8_t *data, uint8_t length) {
+    if (data == NULL || length == 0) {
+        return false;
+    }
+
+    switch (data[0]) {
+        case id_dynamic_keymap_reset:
+        case id_eeprom_reset:
+            fn_features_disable();
+            break;
+
+        case id_dynamic_keymap_set_keycode:
+        case id_dynamic_keymap_set_buffer:
+            fn_features_validate_pending = true;
+            break;
+
+        default:
+            break;
+    }
+
+    return false;
+}
+#endif
 
 
 /**
@@ -184,10 +332,10 @@ void long_press_key(void)
             f_win_lock = 0;
 
             if (dev_info.sys_sw_state == SYS_SW_MAC) {
-                default_layer_set(1 << 0);  // MAC
+                default_layer_set(1 << LAYER_MAC_BASE);  // MAC
                 keymap_config.nkro = 0;     
             } else {
-                default_layer_set(1 << 2);  // WIN
+                default_layer_set(1 << LAYER_WIN_BASE);  // WIN
                 keymap_config.nkro = 1;   
             }
         }
@@ -214,6 +362,15 @@ void m_break_all_key(void)
     
     uint8_t report_buf[16];
     bool nkro_temp = keymap_config.nkro; 
+
+    // Keep the optional Fn state in sync with NuPhy's forced report clear
+    // when changing OS/link mode or resetting the device.
+    fn_held = false;
+    tap_hold_active = false;
+    tap_hold_hold_sent = false;
+    tap_hold_active_2 = false;
+    tap_hold_hold_sent_2 = false;
+    fn_row_release_all();
 
     clear_weak_mods();
     clear_mods();
@@ -317,7 +474,7 @@ void dial_sw_scan(void)
     if (dial_scan & 0x02) {
         if (dev_info.sys_sw_state != SYS_SW_WIN) {
             f_sys_show = 1;
-            default_layer_set(1 << 2);  
+            default_layer_set(1 << LAYER_WIN_BASE);  
             dev_info.sys_sw_state = SYS_SW_WIN;
             keymap_config.no_gui  = f_win_lock;
             m_break_all_key();  
@@ -326,7 +483,7 @@ void dial_sw_scan(void)
     } else {
         if (dev_info.sys_sw_state != SYS_SW_MAC) {
             f_sys_show = 1;
-            default_layer_set(1 << 0);
+            default_layer_set(1 << LAYER_MAC_BASE);
             dev_info.sys_sw_state = SYS_SW_MAC;
             f_win_lock            = keymap_config.no_gui;
             m_break_all_key();  
@@ -388,14 +545,14 @@ void m_power_on_dial_sw_scan(void)
     // WIN/MAC 
     if (dial_scan_sys) {
         if (dev_info.sys_sw_state != SYS_SW_WIN) {
-            default_layer_set(1 << 2);  // WIN
+            default_layer_set(1 << LAYER_WIN_BASE);  // WIN
             dev_info.sys_sw_state = SYS_SW_WIN;
             keymap_config.nkro    = 1;  
             m_break_all_key();  
         }
     } else {
         if (dev_info.sys_sw_state != SYS_SW_MAC) {
-            default_layer_set(1 << 0);  // MAC
+            default_layer_set(1 << LAYER_MAC_BASE);  // MAC
             dev_info.sys_sw_state = SYS_SW_MAC;
             keymap_config.nkro    = 0; 
             f_win_lock            = keymap_config.no_gui;
@@ -414,7 +571,138 @@ bool process_record_kb(uint16_t keycode, keyrecord_t *record) {
         return false;
     }
     no_act_time = 0;
+
+    if (fn_features_validate_pending) {
+        fn_features_validate_pending = false;
+        fn_features_validate_configuration();
+    }
+
+    if (record->event.key.row == FN_KEY_ROW && record->event.key.col >= FN_ROW_FIRST_COL && record->event.key.col <= FN_ROW_LAST_COL) {
+        uint8_t index = record->event.key.col - FN_ROW_FIRST_COL;
+
+        if (!record->event.pressed && fn_row_key_active[index]) {
+            unregister_code16(fn_row_keycode[index]);
+            fn_row_key_active[index] = false;
+            return false;
+        }
+
+        if (record->event.pressed && (dev_info.sys_sw_state == SYS_SW_MAC || dev_info.sys_sw_state == SYS_SW_WIN)) {
+            bool remap = false;
+            bool is_mac = dev_info.sys_sw_state == SYS_SW_MAC;
+            uint8_t fn_layer       = is_mac ? LAYER_MAC_FN       : LAYER_WIN_FN;
+            uint8_t base_layer     = is_mac ? LAYER_MAC_BASE     : LAYER_WIN_BASE;
+            uint8_t target_layer   = fn_layer;
+
+            if (f_fn_lock && fn_held) {
+                // Fn Lock + Fn held: give the real base-layer key so the
+                // user can still type the F-key while locked.
+                target_layer = base_layer;
+                remap        = true;
+            } else if (f_fn_lock && !fn_held) {
+                // Fn Lock without Fn: the F1-F12 row behaves as if Fn were
+                // held.
+                target_layer = fn_layer;
+                remap        = true;
+            }
+
+            if (remap) {
+                uint16_t target_keycode = keycode_at_keymap_location(
+                    target_layer,
+                    record->event.key.row,
+                    record->event.key.col
+                );
+
+                if (fn_row_keycode_supported(target_keycode)) {
+                    fn_row_keycode[index]    = target_keycode;
+                    fn_row_key_active[index] = true;
+                    register_code16(target_keycode);
+                    return false;
+                }
+            }
+        }
+    }
+
     switch (keycode) {
+        case MO(LAYER_MAC_FN):
+            if (dev_info.sys_sw_state != SYS_SW_MAC) {
+                if (!record->event.pressed) {
+                    fn_held = false;
+                }
+                return true;
+            }
+
+            if (record->event.pressed) {
+                fn_held = true;
+            } else {
+                fn_held = false;
+            }
+            return true;
+
+        case MO(LAYER_WIN_FN):
+            if (dev_info.sys_sw_state != SYS_SW_WIN) {
+                if (!record->event.pressed) {
+                    fn_held = false;
+                }
+                return true;
+            }
+
+            if (record->event.pressed) {
+                fn_held = true;
+            } else {
+                fn_held = false;
+            }
+            return true;
+
+        case FN_LOCK:
+            if (record->event.pressed && (dev_info.sys_sw_state == SYS_SW_MAC || dev_info.sys_sw_state == SYS_SW_WIN)) {
+                f_fn_lock = !f_fn_lock;
+                fn_features_save_config();
+            }
+            return false;
+
+        case TAP_HOLD_1:
+            if (record->event.pressed) {
+                tap_hold_timer     = timer_read();
+                tap_hold_active    = true;
+                tap_hold_hold_sent = false;
+            } else if (tap_hold_active) {
+                tap_hold_active = false;
+                if (!tap_hold_hold_sent) {
+#ifdef VIA_ENABLE
+                    dynamic_keymap_macro_send(timer_elapsed(tap_hold_timer) >= TAP_HOLD_TERM ? 1 : 0);
+#else
+                    if (timer_elapsed(tap_hold_timer) >= TAP_HOLD_TERM) {
+                        tap_code(KC_CAPS);
+                    } else {
+                        tap_code16(LCTL(KC_SPC));
+                    }
+#endif
+                }
+                tap_hold_hold_sent = false;
+            }
+            return false;
+
+        case TAP_HOLD_2:
+            if (record->event.pressed) {
+                tap_hold_timer_2     = timer_read();
+                tap_hold_active_2    = true;
+                tap_hold_hold_sent_2 = false;
+            } else if (tap_hold_active_2) {
+                tap_hold_active_2 = false;
+                if (!tap_hold_hold_sent_2) {
+#ifdef VIA_ENABLE
+                    dynamic_keymap_macro_send(timer_elapsed(tap_hold_timer_2) >= TAP_HOLD_TERM ? 4 : 3);
+#else
+                    if (timer_elapsed(tap_hold_timer_2) >= TAP_HOLD_TERM) {
+                        tap_code(KC_CAPS);
+                    } else {
+                        tap_code16(LCTL(KC_SPC));
+                    }
+#endif
+                }
+                tap_hold_hold_sent_2 = false;
+            }
+            return false;
         case RF_DFU:
             if (record->event.pressed) {
                 if (dev_info.link_mode != LINK_USB) return false;
@@ -727,6 +1015,8 @@ void m_londing_eeprom_data(void)
         user_config.ee_side_rgb             = side_rgb;
         user_config.ee_side_colour          = side_colour;
         f_dev_sleep_enable                  = true;
+        f_fn_lock                           = false;
+        fn_features_magic_set(&user_config);
         eeconfig_update_user_datablock(&user_config);  
     } else {
         side_mode_a   = user_config.ee_side_mode_a;
@@ -735,6 +1025,12 @@ void m_londing_eeprom_data(void)
         side_speed  = user_config.ee_side_speed;
         side_rgb    = user_config.ee_side_rgb;
         side_colour = user_config.ee_side_colour;
+
+        if (!fn_features_magic_is_valid(&user_config)) {
+            f_fn_lock = false;
+            fn_features_magic_set(&user_config);
+            eeconfig_update_user_datablock(&user_config);
+        }
     }
 }
 
@@ -742,6 +1038,8 @@ void m_londing_eeprom_data(void)
 /**
    qmk keyboard post init
  */
+static void ind_rescan(void);
+
 void keyboard_post_init_kb(void)
 {
     m_gpio_init();      
@@ -751,6 +1049,8 @@ void keyboard_post_init_kb(void)
 
     m_break_all_key();
     m_londing_eeprom_data();
+    fn_features_validate_configuration();
+    ind_rescan();
     m_power_on_dial_sw_scan();
     keyboard_post_init_user();
 
@@ -760,11 +1060,78 @@ void keyboard_post_init_kb(void)
 /**
    rgb_matrix_indicators_user
  */
+
+// Current hardware-mode base layer: Mac LAYER_MAC_BASE, Windows LAYER_WIN_BASE.
+static uint8_t ind_base_layer_for_mode(void) {
+    if (dev_info.sys_sw_state == SYS_SW_MAC) {
+        return LAYER_MAC_BASE;
+    }
+    return LAYER_WIN_BASE;
+}
+
+// Cache the LED positions of keys mapped to KC_CAPS (green), TAP_HOLD_1
+// (blue) and the Fn key (orange) in the current base layer, so the
+// indicators follow VIA remaps instead of being hard-coded.
+// keycode_at_keymap_location() reads the VIA EEPROM cache when available and
+// the compile-time keymap otherwise, so both build targets behave the same.
+static void ind_rescan(void) {
+    uint8_t  base   = ind_base_layer_for_mode();
+    uint16_t fn_kc  = (base == LAYER_MAC_BASE) ? MO(LAYER_MAC_FN) : MO(LAYER_WIN_FN);
+
+    ind_caps_count     = 0;
+    ind_tap_hold_count = 0;
+    ind_fn_pos         = NO_LED;
+
+    for (uint8_t row = 0; row < MATRIX_ROWS; row++) {
+        for (uint8_t col = 0; col < MATRIX_COLS; col++) {
+            uint16_t kc  = keycode_at_keymap_location(base, row, col);
+            uint8_t  led = g_led_config.matrix_co[row][col];
+            if (led == NO_LED) {
+                continue;
+            }
+
+            if (kc == KC_CAPS) {
+                if (ind_caps_count < IND_MAX_POS) {
+                    ind_caps_pos[ind_caps_count++] = led;
+                }
+            } else if (kc == TAP_HOLD_1) {
+                if (ind_tap_hold_count < IND_MAX_POS) {
+                    ind_tap_hold_pos[ind_tap_hold_count++] = led;
+                }
+            } else if (kc == fn_kc) {
+                ind_fn_pos = led;
+            }
+        }
+    }
+}
+
 bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max)
 {
     if (keymap_config.no_gui) {
         rgb_matrix_set_color(72, 0x00, 0x80, 0x00);
     }
+
+    if (host_keyboard_led_state().caps_lock) {
+        // Tap/Hold keys first in blue, then KC_CAPS in green, so a key that
+        // appears in both lists keeps the green Caps colour (Caps priority).
+        for (uint8_t i = 0; i < ind_tap_hold_count; i++) {
+            uint8_t led = ind_tap_hold_pos[i];
+            if (led >= led_min && led < led_max) {
+                rgb_matrix_set_color(led, IND_TAP_HOLD_R, IND_TAP_HOLD_G, IND_TAP_HOLD_B);
+            }
+        }
+        for (uint8_t i = 0; i < ind_caps_count; i++) {
+            uint8_t led = ind_caps_pos[i];
+            if (led >= led_min && led < led_max) {
+                rgb_matrix_set_color(led, IND_CAPS_LOCK_R, IND_CAPS_LOCK_G, IND_CAPS_LOCK_B);
+            }
+        }
+    }
+
+    if (f_fn_lock && ind_fn_pos != NO_LED && ind_fn_pos >= led_min && ind_fn_pos < led_max) {
+        rgb_matrix_set_color(ind_fn_pos, IND_FN_LOCK_R, IND_FN_LOCK_G, IND_FN_LOCK_B);
+    }
+
     return true;
 }
 
@@ -773,6 +1140,37 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max)
  */
 void housekeeping_task_kb(void)
 {
+
+    if (fn_features_validate_pending) {
+        fn_features_validate_pending = false;
+        fn_features_validate_configuration();
+    }
+
+    if (tap_hold_active && !tap_hold_hold_sent && timer_elapsed(tap_hold_timer) >= TAP_HOLD_TERM) {
+        tap_hold_hold_sent = true;
+#ifdef VIA_ENABLE
+        dynamic_keymap_macro_send(1);
+#else
+        tap_code(KC_CAPS);
+#endif
+    }
+
+    if (tap_hold_active_2 && !tap_hold_hold_sent_2 && timer_elapsed(tap_hold_timer_2) >= TAP_HOLD_TERM) {
+        tap_hold_hold_sent_2 = true;
+#ifdef VIA_ENABLE
+        dynamic_keymap_macro_send(4);
+#else
+        tap_code(KC_CAPS);
+#endif
+    }
+
+    // Refresh indicator positions at most every 500 ms; this follows VIA
+    // keymap writes and Mac/Windows hardware-mode switches without scanning
+    // the keymap on every RGB frame.
+    if (timer_elapsed32(ind_rescan_timer) >= 500) {
+        ind_rescan_timer = timer_read32();
+        ind_rescan();
+    }
 
     timer_pro();
 

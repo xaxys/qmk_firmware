@@ -192,6 +192,26 @@
 	{
 		"name": "Side\nSlow",
 		"title": "Side Speed -"
+	},
+	{
+		"name": "Code\nMode",
+		"title": "Code Mode"
+	},
+	{
+		"name": "Paint\nMode",
+		"title": "Paint Mode"
+	},
+	{
+		"name": "Fn\nLock",
+		"title": "Lock F1-F12 to Mac layer 1 or Windows layer 3"
+	},
+	{
+		"name": "Tap/\nHold 1",
+		"title": "Tap sends VIA Macro 0; hold 500 ms sends VIA Macro 1"
+	},
+	{
+		"name": "Tap/\nHold 2",
+		"title": "Tap sends VIA Macro 3; hold 500 ms sends VIA Macro 4"
 	}
 ]
 }
