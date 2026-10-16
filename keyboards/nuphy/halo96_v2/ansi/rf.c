@@ -33,6 +33,7 @@ extern bool f_rf_new_adv_ok;
 extern bool f_rf_reset;
 extern bool f_rf_hand_ok;
 extern bool f_goto_sleep;
+extern bool f_wakeup_prepare;
 
 uint8_t  uart_bit_report_buf[32] = {0};
 uint8_t  func_tab[32]            = {0};
@@ -43,6 +44,29 @@ uint16_t syskb_report            = 0;
 uint8_t  sync_lost               = 0;
 uint8_t  disconnect_delay        = 0;
 bool     uart_repeat_flag        = 0;
+
+// Reliable wireless key state delivery.
+//
+// The radio hop has no end to end acknowledgement: BLE HID input reports are
+// unacknowledged notifications, and uart_send_report() drops a frame outright
+// while the link is not up. A lost key-up therefore leaves the host holding a
+// key nobody is pressing, and the host starts auto repeating it - one tap of
+// space turning into thirty, one tap of backspace eating a whole line.
+//
+// Recovery is a level triggered re-push of the current key state, so it has to
+// run faster than the host auto-repeat delay (~250 ms) or the repeat starts
+// before the correction lands. Every other NuPhy board in this tree uses 50 ms;
+// the Halo V2 boards were left at 300 ms, which is longer than that delay.
+#define RF_REPORT_PUSH_FAST   50   // ms between re-pushes while the state may be stale
+#define RF_REPORT_PUSH_SLOW   300  // ms between re-pushes once the link looks settled
+#define RF_REPORT_FAST_TERM   30   // 10 ms ticks: fast cadence for this long after activity
+#define RF_REPORT_KEEP_TERM   2000 // 10 ms ticks: stop re-pushing entirely once idle
+#define RF_REPORT_ACK_WAIT    2    // ms to wait for the module ACK after a report
+#define RF_REPORT_ACK_PROBES  8    // reports used to learn whether the module ACKs at all
+
+static bool    rf_state_unsent;    // a key state change never reached the wire
+static bool    rf_report_ack_seen; // module has acknowledged a report frame before
+static uint8_t rf_ack_probe_left = RF_REPORT_ACK_PROBES;
 
 extern DEV_INFO_STRUCT dev_info;
 extern host_driver_t  *m_host_driver;
@@ -56,12 +80,16 @@ extern bool            f_dial_sw_init_ok;
 
 report_mouse_t mousekey_get_report(void);
 void           uart_init(uint32_t baud); // qmk uart.c
-void           uart_send_report(uint8_t report_type, uint8_t *report_buf, uint8_t report_size);
+bool           uart_send_report(uint8_t report_type, uint8_t *report_buf, uint8_t report_size);
 void           UART_Send_Bytes(uint8_t *Buffer, uint32_t Length);
 uint8_t        get_checksum(uint8_t *buf, uint8_t len);
 void           uart_receive_pro(void);
 void           m_break_all_key(void);
 uint16_t       host_last_consumer_usage(void);
+void           rf_wakeup_now(void); // sleep.c
+
+static bool rf_state_push(void);
+static bool uart_wait_ack(uint8_t timeout_ms);
 
 /**
  * @brief Uart auto nkey send
@@ -127,28 +155,48 @@ static void uart_auto_nkey_send(uint8_t *pre_bit_report, uint8_t *now_bit_report
 
 
 /**
+ * @brief  Re-push the full current key state to the host.
+ * @return true when the frame reached the UART.
+ */
+static bool rf_state_push(void) {
+    if (!uart_send_report(CMD_RPT_BYTE_KB, bytekb_report_buf, 8)) return false;
+
+    wait_us(200);
+
+    if (f_bit_kb_act) {
+        uart_send_report(CMD_RPT_BIT_KB, uart_bit_report_buf, 16);
+    }
+
+    return true;
+}
+
+/**
  * @brief  Uart send keys report.
+ * @note   Level triggered re-push of the current key state. This is what
+ *         recovers a key-up the radio dropped, so the cadence has to stay
+ *         below the host auto-repeat delay while the state may be stale.
  */
 void uart_send_report_func(void)
 {
     static uint32_t interval_timer = 0;
+    uint32_t        interval;
 
     if (dev_info.link_mode == LINK_USB) return;
     keyboard_protocol          = 1;
 
-    if (timer_elapsed32(interval_timer) > 300) {
-        interval_timer = timer_read32();
-        if (no_act_time <= 2000) {
-            uart_send_report(CMD_RPT_BYTE_KB, bytekb_report_buf, 8);
-            wait_us(200);
-
-            if(f_bit_kb_act)
-            uart_send_report(CMD_RPT_BIT_KB, uart_bit_report_buf, 16);
-        }
-        else {
-            f_bit_kb_act = 0;
-        }
+    if (rf_state_unsent || no_act_time <= RF_REPORT_FAST_TERM) {
+        interval = RF_REPORT_PUSH_FAST;
+    } else if (no_act_time <= RF_REPORT_KEEP_TERM) {
+        interval = RF_REPORT_PUSH_SLOW;
+    } else {
+        f_bit_kb_act = 0;
+        return;
     }
+
+    if (timer_elapsed32(interval_timer) < interval) return;
+    interval_timer = timer_read32();
+
+    rf_state_push();
 }
 
 /**
@@ -481,6 +529,9 @@ void dev_sts_sync(void) {
 
     if (f_rf_reset) {
         f_rf_reset = 0;
+        // The module dropped everything it was holding, so the host view of the
+        // key state is unknown until the next push gets through.
+        rf_state_unsent = true;
         wait_ms(100);
         writePinLow(NRF_RESET_PIN);
         wait_ms(50);
@@ -527,6 +578,12 @@ void dev_sts_sync(void) {
                 if (dev_info.link_mode == LINK_RF_24) {
                     uart_send_cmd(CMD_SET_24G_NAME, 10, 30);
                 }
+
+                // Every key-up emitted while the link was down is gone for
+                // good, and the host is still holding that key. Push the
+                // current state now rather than waiting for the next tick.
+                rf_state_unsent = true;
+                rf_state_push();
             }
         }
     }
@@ -617,15 +674,45 @@ uint8_t get_checksum(uint8_t *buf, uint8_t len) {
 }
 
 /**
+ * @brief Wait for the RF module to acknowledge the frame just transmitted.
+ * @param timeout_ms  how long to wait, in 1 ms polling steps.
+ * @note Same granularity uart_send_cmd() already uses for command ACKs.
+ */
+static bool uart_wait_ack(uint8_t timeout_ms) {
+    while (timeout_ms--) {
+        uart_receive_pro();
+        if (f_uart_ack) return true;
+        wait_ms(1);
+    }
+
+    return false;
+}
+
+/**
  * @brief Uart send report.
  * @param report_type  report_type
  * @param report_buf  report_buf
  * @param report_size  report_size
+ * @return true when the frame was handed to the UART.
  */
-void uart_send_report(uint8_t report_type, uint8_t *report_buf, uint8_t report_size) {
-    if (f_dial_sw_init_ok == 0) return;
-    if (dev_info.link_mode == LINK_USB) return;
-    if (dev_info.rf_state != RF_CONNECT) return;
+bool uart_send_report(uint8_t report_type, uint8_t *report_buf, uint8_t report_size) {
+    if (dev_info.link_mode == LINK_USB) return false;
+
+    // housekeeping_task() runs after keyboard_task(), so the key that woke the
+    // keyboard reaches this point while the RF module is still powered down and
+    // before Sleep_Handle() gets a chance to wake it. Wake it first.
+    if (f_wakeup_prepare) rf_wakeup_now();
+
+    bool keyboard_report = (report_type == CMD_RPT_BYTE_KB) || (report_type == CMD_RPT_BIT_KB);
+
+    if (f_dial_sw_init_ok == 0 || dev_info.rf_state != RF_CONNECT) {
+        // Key state is level triggered, so a dropped frame leaves the host
+        // holding a key nobody presses. Remember it and let
+        // uart_send_report_func() re-push once the link is usable again.
+        if (keyboard_report) rf_state_unsent = true;
+
+        return false;
+    }
 
     Usart_Mgr.TXDBuf[0] = UART_HEAD;
     Usart_Mgr.TXDBuf[1] = report_type;
@@ -635,13 +722,38 @@ void uart_send_report(uint8_t report_type, uint8_t *report_buf, uint8_t report_s
     memcpy(&Usart_Mgr.TXDBuf[4], report_buf, report_size);
     Usart_Mgr.TXDBuf[4 + report_size] = get_checksum(&Usart_Mgr.TXDBuf[4], report_size);
 
+    // Probe a handful of reports to learn whether this module acknowledges
+    // report frames at all. Once we know it does not, skip the wait so a
+    // healthy link pays nothing for it; once we know it does, silence means the
+    // frame was lost and the state has to be re-pushed.
+    bool want_ack = keyboard_report && (rf_ack_probe_left > 0 || rf_report_ack_seen);
+
+    if (want_ack) {
+        if (rf_ack_probe_left > 0) rf_ack_probe_left--;
+
+        f_uart_ack = 0;
+    }
+
     uart_repeat_flag = 1;
 
     UART_Send_Bytes(&Usart_Mgr.TXDBuf[0], report_size + 5);
 
     uart_repeat_flag = 0;
 
+    if (want_ack) {
+        if (uart_wait_ack(RF_REPORT_ACK_WAIT)) {
+            rf_report_ack_seen = true;
+            rf_state_unsent    = false;
+        } else {
+            rf_state_unsent = rf_report_ack_seen;
+        }
+    } else if (keyboard_report) {
+        rf_state_unsent = false;
+    }
+
     wait_us(200);
+
+    return true;
 }
 
 /**

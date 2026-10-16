@@ -31,6 +31,23 @@ uint8_t uart_send_cmd(uint8_t cmd, uint8_t ack_cnt, uint8_t delayms);
 
 
 /**
+ * @brief  Bring the RF module and the LED rails back out of the sleep state.
+ * @note   Also called from uart_send_report(), because housekeeping_task() runs
+ *         after keyboard_task(): without this the key that wakes the keyboard
+ *         would be transmitted to a module that is still powered down.
+ */
+void rf_wakeup_now(void) {
+    f_wakeup_prepare = 0;
+
+    writePinHigh(DC_BOOST_PIN);
+    writePinHigh(RGB_DRIVER_SDB1);
+    writePinHigh(RGB_DRIVER_SDB2);
+
+    uart_send_cmd(CMD_HAND, 0, 1);
+}
+
+
+/**
  * @brief  Sleep Handle.
  */
 void Sleep_Handle(void) {
@@ -63,13 +80,7 @@ void Sleep_Handle(void) {
 
     // wakeup check
     if (f_wakeup_prepare && (no_act_time < 10)) {
-        f_wakeup_prepare = 0;
-
-        writePinHigh(DC_BOOST_PIN);
-        writePinHigh(RGB_DRIVER_SDB1);
-        writePinHigh(RGB_DRIVER_SDB2);
-
-        uart_send_cmd(CMD_HAND, 0, 1);
+        rf_wakeup_now();
 
         if (dev_info.link_mode == LINK_USB) {
             #define USB_GETSTATUS_REMOTE_WAKEUP_ENABLED (2U)

@@ -190,7 +190,7 @@ void uart_receive_pro(void);
 void Sleep_Handle(void);
 void uart_send_report_func(void);
 uint8_t uart_send_cmd(uint8_t cmd, uint8_t ack_cnt, uint8_t delayms);
-void uart_send_report(uint8_t report_type, uint8_t *report_buf, uint8_t report_size);
+bool uart_send_report(uint8_t report_type, uint8_t *report_buf, uint8_t report_size);
 void device_reset_show(void);
 void device_reset_init(void);
 void rgb_test_show(void);
